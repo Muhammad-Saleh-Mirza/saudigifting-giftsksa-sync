@@ -79,6 +79,13 @@ def fetch_giftsksa(path):
     url = f"{GIFTSKSA_BASE_URL}{path}/{GIFTSKSA_TOKEN}"
     log(f"GET {url}")
     resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers=HTTP_HEADERS)
+    if resp.status_code >= 400:
+        # Diagnostic dump: a WAF/CDN block page usually says so explicitly
+        # (e.g. "Cloudflare", "Access denied", "Ray ID") - print it so the
+        # real cause is visible in the Actions log instead of just "403".
+        log(f"  non-OK response: HTTP {resp.status_code}")
+        log(f"  response headers: {dict(resp.headers)}")
+        log(f"  response body (first 1000 chars): {resp.text[:1000]!r}")
     resp.raise_for_status()
     data = resp.json()
     if not isinstance(data, list):
