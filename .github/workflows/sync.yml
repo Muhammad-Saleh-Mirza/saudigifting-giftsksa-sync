@@ -1,0 +1,36 @@
+name: GiftsKSA daily sync
+
+on:
+  schedule:
+    # 23:07 UTC = 02:07 Asia/Riyadh. Uses exactly 3 of the 5 daily GiftsKSA
+    # API quota requests (Product, Price, Stock - one call each).
+    - cron: "7 23 * * *"
+  workflow_dispatch:
+    inputs:
+      use_test_api:
+        description: "Run against the free, unlimited GiftsKSA test mirror instead of production (safe to use any time, costs no quota)"
+        type: boolean
+        default: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run sync
+        env:
+          GIFTSKSA_TOKEN: ${{ secrets.GIFTSKSA_TOKEN }}
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USERNAME: ${{ secrets.ODOO_USERNAME }}
+          ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+          GIFTSKSA_BASE_URL: ${{ (github.event.inputs.use_test_api == 'true') && 'https://api-test.jasani.ae' || '' }}
+        run: python sync.py
