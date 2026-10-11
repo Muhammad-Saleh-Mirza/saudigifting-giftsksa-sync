@@ -94,6 +94,27 @@ def fetch_giftsksa(path):
     return data
 
 
+def diagnostic_homepage_ping():
+    """
+    Harmless, token-free, zero-quota GET to the bare domain root (no API
+    path at all). Purely diagnostic: tells us whether the whole domain is
+    blocked from this runner's IP, or only the specific gated API paths
+    are. Never raises - a failure here must never abort the real sync.
+    """
+    url = GIFTSKSA_BASE_URL + "/"
+    log(f"[diagnostic] GET {url} (plain homepage ping, no token)")
+    try:
+        resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers=HTTP_HEADERS)
+        log(f"[diagnostic]   -> HTTP {resp.status_code}")
+        if resp.status_code >= 400:
+            log(f"[diagnostic]   response headers: {dict(resp.headers)}")
+            log(f"[diagnostic]   response body (first 500 chars): {resp.text[:500]!r}")
+        else:
+            log("[diagnostic]   homepage reachable - block (if any) is specific to the API path(s)")
+    except Exception as exc:  # noqa: BLE001 - diagnostic only, must never abort the run
+        log(f"[diagnostic]   request itself failed: {exc}")
+
+
 def fetch_image_b64(image_url):
     resp = requests.get(image_url, timeout=REQUEST_TIMEOUT, headers=HTTP_HEADERS)
     resp.raise_for_status()
@@ -175,6 +196,11 @@ def main():
     run_timestamp = run_started.strftime("%Y-%m-%d %H:%M:%S")
     log(f"=== GiftsKSA -> Odoo sync starting (run timestamp {run_timestamp}) ===")
     log(f"GiftsKSA base URL: {GIFTSKSA_BASE_URL}")
+
+    # 0. Diagnostic only (temporary - remove once the 403 is root-caused):
+    #    a plain, token-free ping to the bare domain, to tell a blanket
+    #    domain-wide block apart from a block on just the API path(s).
+    diagnostic_homepage_ping()
 
     # 1. Pull all three GiftsKSA datasets FIRST. If any fails, abort before
     #    touching Odoo at all (never apply a partial/inconsistent pull).
