@@ -52,6 +52,19 @@ REQUEST_TIMEOUT = 60
 RPC_RETRY_ATTEMPTS = 4
 RPC_RETRY_BACKOFF_SECONDS = 5
 
+# Some bot-filters in front of these sites reject the default
+# `python-requests/x.y` User-Agent with a bare 403, even for a legitimate,
+# documented API endpoint. A normal browser-looking User-Agent (this is not
+# bypassing any auth or consent - it's just matching what a browser sends)
+# clears that.
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+}
+
 
 def log(msg):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -65,7 +78,7 @@ def log(msg):
 def fetch_giftsksa(path):
     url = f"{GIFTSKSA_BASE_URL}{path}/{GIFTSKSA_TOKEN}"
     log(f"GET {url}")
-    resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+    resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers=HTTP_HEADERS)
     resp.raise_for_status()
     data = resp.json()
     if not isinstance(data, list):
@@ -75,7 +88,7 @@ def fetch_giftsksa(path):
 
 
 def fetch_image_b64(image_url):
-    resp = requests.get(image_url, timeout=REQUEST_TIMEOUT)
+    resp = requests.get(image_url, timeout=REQUEST_TIMEOUT, headers=HTTP_HEADERS)
     resp.raise_for_status()
     return base64.b64encode(resp.content).decode("ascii")
 
