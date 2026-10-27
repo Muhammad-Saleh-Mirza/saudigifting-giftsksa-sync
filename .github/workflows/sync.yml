@@ -8,7 +8,11 @@ on:
   workflow_dispatch:
     inputs:
       use_test_api:
-        description: "Run against the free, unlimited GiftsKSA test mirror instead of production (safe to use any time, costs no quota)"
+        description: "Pull from the free, unlimited GiftsKSA test mirror instead of production (safe to use any time, costs no quota)"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Dry run: log every intended Odoo change but don't actually write anything to Odoo (combine with the test-mirror option above for a fully safe rehearsal - ODOO_URL/ODOO_DB are always your real site either way)"
         type: boolean
         default: false
 
@@ -33,4 +37,5 @@ jobs:
           ODOO_USERNAME: ${{ secrets.ODOO_USERNAME }}
           ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
           GIFTSKSA_BASE_URL: ${{ (github.event.inputs.use_test_api == 'true') && 'https://api-test.jasani.ae' || '' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && 'true' || '' }}
         run: python sync.py
