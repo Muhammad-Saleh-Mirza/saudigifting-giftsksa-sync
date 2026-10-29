@@ -24,7 +24,45 @@ Exit behaviour: never partially applies a run. If any of the three GiftsKSA
 API calls fail, the script aborts before touching Odoo at all.
 
 --------------------------------------------------------------------------
-What's new in this version (2026-10-26)
+What's new in this version (2026-10-29)
+--------------------------------------------------------------------------
+Root-caused and fixed the duplicate-product problem the 2026-10-26
+create-path fix (below) was supposed to prevent but didn't fully: that fix
+only attached a new code as a variant of an existing product when
+GiftsKSA's own per-row attribute data (Color/Size) was present and
+parseable. On the runs that actually produced the 600+ duplicate "TROPIKANA
+..." / "ADF ..." / etc. products (confirmed by reading the live data - not
+guessed), the incoming rows for codes like "TROPIKANA Black-3XL" matched an
+existing product by NAME, but had no usable attrs, so they silently fell
+through to create_flat_product and spawned a lookalike duplicate instead.
+
+Three changes, all scoped to closing exactly that hole:
+
+1. Default-code fallback parsing. When a row's own attrs are empty/
+   unparseable, Color/Size are now also recovered from the default_code
+   itself (e.g. "TROPIKANA Black-3XL" -> Size "3X-Large", Color "Black")
+   before giving up - checked against what the matched product's own
+   existing variants actually look like, never guessed blindly. If this
+   still can't confidently determine a dimension the product needs, the
+   row is skipped and logged, never flat-created as a duplicate.
+
+2. A second, independent safety net right before every flat create: even
+   outside the name-matched batch above, if an active+published product
+   with the exact same name already exists, this version refuses to
+   create another one - it makes one more attempt to attach as a variant
+   (same fallback parsing), and if that still doesn't work, skips and logs
+   loudly rather than silently duplicating. This is defense in depth, not
+   a replacement for fix #1.
+
+3. A self-healing cleanup pass (run_duplicate_merge_cleanup), run at the
+   end of every sync, that finds any same-name duplicate products that
+   still exist (from before this fix, or from anything unforeseen) and
+   either merges them into the main product as a new variant or archives
+   them as redundant - automatically, every day, so this class of problem
+   can't silently pile back up. Never hard-deletes anything.
+
+--------------------------------------------------------------------------
+What's new in the previous version (2026-10-26)
 --------------------------------------------------------------------------
 Two things were added on top of the previously-deployed script, both
 scoped exactly to what was agreed before writing this:
@@ -151,6 +189,140 @@ COLOR_HEX = {
     "Beige": "#F5F5DC", "Khaki": "#C3B091", "Brown": "#964B00",
     "Pink": "#FFC0CB", "Purple": "#800080",
 }
+
+
+# --------------------------------------------------------------------------
+# Default-code-suffix fallback parser. Used only when GiftsKSA's own
+# per-row attribute data (attrs, from parse_attrs) is missing or doesn't
+# parse - see the "What's new (2026-10-29)" note above for why this
+# exists. (abbreviation as it appears in a default_code, canonical Odoo
+# Size attribute value name) - sorted longest-abbreviation-first below so
+# e.g. "XXXL" is tried before "XL" is.
+# --------------------------------------------------------------------------
+
+SIZE_TOKEN_CANONICAL = [
+    ("XXXL", "3X-Large"), ("3X-Large", "3X-Large"), ("3XL", "3X-Large"),
+    ("XX-Large", "XX-Large"), ("XXL", "XX-Large"), ("2XL", "XX-Large"),
+    ("X-Large", "X-Large"), ("XL", "X-Large"),
+    ("4X-Large", "4X-Large"), ("4XL", "4X-Large"),
+    ("5X-Large", "5X-Large"), ("5XL", "5X-Large"),
+    ("X-Small", "X-Small"), ("XS", "X-Small"),
+    ("Large", "Large"), ("L", "Large"),
+    ("Medium", "Medium"), ("M", "Medium"),
+    ("Small", "Small"), ("S", "Small"),
+]
+SIZE_TOKEN_CANONICAL.sort(key=lambda pair: -len(pair[0]))
+
+
+def normalize_size_value(value_name):
+    """
+    Maps a shorthand size like 'XL' (as GiftsKSA's own attrs sometimes send
+    it) to Odoo's existing canonical value name ('X-Large'), so this never
+    creates a redundant near-duplicate Size value alongside the real one.
+    Returns the value unchanged if it isn't a recognised shorthand.
+    """
+    for token, canonical in SIZE_TOKEN_CANONICAL:
+        if value_name == token:
+            return canonical
+    return value_name
+
+
+def strip_size_suffix(code):
+    """
+    If `code` ends with a recognisable size token - "...-XL" or "...(XL)"
+    style, both seen in real default_codes from this feed - returns
+    (rest_of_code, canonical_size_name). Otherwise returns (code, None).
+    """
+    for token, canonical in SIZE_TOKEN_CANONICAL:
+        if code.endswith("-" + token):
+            return code[: -(len(token) + 1)], canonical
+        paren = "(" + token + ")"
+        if code.endswith(paren):
+            rest = code[: -len(paren)].rstrip()
+            return rest, canonical
+    return code, None
+
+
+def group_common_prefix(codes):
+    """Longest string every code in `codes` starts with."""
+    if not codes:
+        return ""
+    prefix = codes[0]
+    for c in codes[1:]:
+        i = 0
+        while i < len(prefix) and i < len(c) and prefix[i] == c[i]:
+            i += 1
+        prefix = prefix[:i]
+    return prefix
+
+
+def parse_combo_from_code(default_code, group_codes, keys_seen):
+    """
+    Best-effort fallback: recovers {"Size": ..., "Color": ...} - only the
+    keys `keys_seen` says the target product actually uses - from the
+    default_code itself. `group_codes` should be every sibling code being
+    considered alongside this one (e.g. the rest of today's batch for the
+    same product name), used to isolate the base-SKU prefix from the
+    color text by finding what's common across all of them.
+
+    Returns {} - never a half-filled or guessed dict - the moment a
+    dimension the product needs can't be confidently determined, so the
+    caller knows to skip this row rather than attach something wrong.
+    """
+    result = {}
+    remaining = default_code
+    if "Size" in keys_seen:
+        rest, size_name = strip_size_suffix(default_code)
+        if not size_name:
+            return {}
+        result["Size"] = size_name
+        remaining = rest
+    if "Color" in keys_seen:
+        sized_rests = []
+        for c in group_codes:
+            rest, size_name = strip_size_suffix(c)
+            if size_name:
+                sized_rests.append(rest)
+        prefix = group_common_prefix(sized_rests) if sized_rests else ""
+        if remaining.startswith(prefix):
+            color = remaining[len(prefix):].strip()
+        else:
+            color = remaining.strip()
+        if not color:
+            return {}
+        result["Color"] = color
+    return result
+
+
+def infer_keys_from_codes(codes):
+    """
+    Used only by run_duplicate_merge_cleanup, for the case where a target
+    template has no attribute lines at all yet - so there's no live "what
+    dimensions does this product use" signal to read the way the main
+    sync's keys_seen normally comes from fetch_template_variant_index.
+    Makes one best-effort guess, purely from a batch of sibling
+    default_codes' own text, at whether they're differentiated by Size,
+    by Color, or both. Returns a subset of {"Size", "Color"} - or an empty
+    set if there isn't enough signal to say (fewer than 2 distinct codes,
+    or nothing distinguishable once a common prefix is stripped) - never a
+    guess that's only half-right.
+    """
+    codes = [c for c in codes if c]
+    if len(codes) < 2:
+        return set()
+    keys = set()
+    sized = [strip_size_suffix(c) for c in codes]
+    if all(size_name for _, size_name in sized):
+        keys.add("Size")
+        rests = [rest for rest, _ in sized]
+    else:
+        rests = codes
+    prefix = group_common_prefix(rests)
+    leftovers = {r[len(prefix):].strip() for r in rests}
+    leftovers.discard("")
+    if len(leftovers) >= 2:
+        keys.add("Color")
+    return keys
 
 
 def log(msg):
@@ -425,7 +597,7 @@ def fetch_template_variant_index(odoo, template_id):
     return keys_seen, existing_lines, combo_to_variant
 
 
-def extend_target_with_new_variants(odoo, target_id, group_rows):
+def extend_target_with_new_variants(odoo, target_id, group_rows, keys_seen_hint=None):
     """
     Given an EXISTING template (target_id) and a batch of never-before-seen
     GiftsKSA rows that all share that template's exact product name, adds
@@ -434,19 +606,53 @@ def extend_target_with_new_variants(odoo, target_id, group_rows):
     product). Returns a set of default_codes that were successfully
     attached this way - any row whose code is NOT in that set should fall
     through to the normal flat-create path (so nothing is silently lost).
+
+    When a row has no usable attrs of its own (GiftsKSA sent none, or they
+    didn't parse), falls back to recovering Color/Size from the row's own
+    default_code via parse_combo_from_code before giving up on it - see the
+    "What's new (2026-10-29)" note at the top of this file for why. A row
+    that still can't be confidently resolved either way is skipped and
+    logged, never flat-created as a duplicate.
+
+    keys_seen_hint is used only by run_duplicate_merge_cleanup, for a
+    target that has no attribute lines of its own yet to read keys_seen
+    from (see infer_keys_from_codes) - the main sync never needs to pass
+    it, since a true name-match target it's attaching new variants onto
+    almost always already has at least one attribute line.
     """
     keys_seen, existing_lines, existing_combo_to_variant = fetch_template_variant_index(odoo, target_id)
     for row in group_rows:
         keys_seen.update(row["attrs"].keys())
+    if not keys_seen and keys_seen_hint:
+        keys_seen = set(keys_seen_hint)
     if not keys_seen:
         return set()
 
+    group_codes_all = [r["default_code"] for r in group_rows]
     new_entries = []
     collided_codes = []
     for row in group_rows:
         attrs = row["attrs"]
         if not attrs:
-            continue
+            fallback = parse_combo_from_code(row["default_code"], group_codes_all, keys_seen)
+            if not fallback:
+                log(
+                    f"  WARNING: {row['default_code']!r} matches existing product "
+                    f"(template id={target_id}) by name but has no usable Color/Size "
+                    f"data - neither from GiftsKSA's own attrs nor recoverable from "
+                    f"the code itself - skipping rather than guessing or flat-creating "
+                    f"a duplicate."
+                )
+                continue
+            attrs = fallback
+        if "Size" in attrs:
+            attrs = dict(attrs)
+            attrs["Size"] = normalize_size_value(attrs["Size"])
+        # Persist the resolved attrs back onto the row - the rest of this
+        # function (the attribute-line-creation pass below) reads
+        # row["attrs"] again rather than this local, so without this the
+        # fallback-recovered values would silently be dropped there.
+        row["attrs"] = attrs
         unexpected = any(resolve_attribute_id(odoo, k) is None for k in attrs)
         if unexpected:
             continue
@@ -613,6 +819,168 @@ def create_flat_product(odoo, resolve_category, row):
         except Exception as img_exc:  # noqa: BLE001
             log(f"  warning: image fetch failed for {row['default_code']}: {img_exc}")
     odoo.execute("product.template", "create", [vals])
+
+
+# --------------------------------------------------------------------------
+# Self-healing duplicate-merge cleanup (new in 2026-10-29 - see the "What's
+# new" note at the top of this file). Runs at the end of every sync, after
+# the main create/update/attach pass above, and catches same-name flat
+# duplicate products however they got there - not only ones this run
+# itself might (in theory) create, since the fixes above should prevent
+# that going forward, but anything already sitting on the storefront for
+# any other reason too.
+# --------------------------------------------------------------------------
+
+def run_duplicate_merge_cleanup(odoo):
+    """
+    Finds published, sellable, FLAT (single-variant, zero attribute-line)
+    product.templates that share an exact name with at least one other
+    such template, and merges every one of them except a chosen "primary"
+    into that primary as a new Color/Size variant - instead of leaving
+    them sitting on the storefront as lookalike duplicates.
+
+    The primary is the oldest template in the name-group (the one
+    everything else should logically attach to). Each other duplicate in
+    the group is only merged in if ALL of the following hold:
+      - it has exactly one variant, and that variant has a default_code
+        to merge by;
+      - a confident Color and/or Size combo can be recovered from that
+        default_code (the same fallback parser the main sync uses - see
+        parse_combo_from_code - with the dimensions it needs to look for
+        read from the primary's own existing attribute lines when it has
+        any, or otherwise best-effort inferred from the group's own codes
+        via infer_keys_from_codes);
+      - that combo doesn't already exist as a variant on the primary; and
+      - the duplicate's variant has zero on-hand stock and no sale order
+        lines against it, so nothing with real transactional history is
+        ever folded away.
+    Any duplicate that fails one of those checks is left exactly as it is
+    and logged for manual review - never guessed, never merged.
+
+    A duplicate that IS merged is archived afterwards - active=False,
+    unpublished, unsellable - never hard-deleted, so it's always
+    recoverable from Odoo's own Archived view if that's ever needed. Only
+    the duplicate is archived; the primary is never touched except to
+    gain the new variant.
+
+    Returns (merged_count, flagged_count).
+    """
+    candidates = odoo.search(
+        "product.template",
+        [["website_published", "=", True], ["sale_ok", "=", True]],
+        ["id", "name", "create_date", "attribute_line_ids", "product_variant_count"],
+    )
+    flat_only = [
+        c for c in candidates
+        if c.get("product_variant_count", 1) == 1 and not c.get("attribute_line_ids")
+    ]
+    by_name = {}
+    for c in flat_only:
+        by_name.setdefault(c["name"], []).append(c)
+
+    merged_count = 0
+    flagged = []
+
+    for name, group in by_name.items():
+        if len(group) < 2:
+            continue
+        group_sorted = sorted(group, key=lambda c: c.get("create_date") or "")
+        primary = group_sorted[0]
+        dupes = group_sorted[1:]
+
+        dupe_variants = odoo.search(
+            "product.product",
+            [["product_tmpl_id", "in", [d["id"] for d in dupes]]],
+            ["id", "product_tmpl_id", "default_code", "barcode", "qty_available"],
+        )
+        variant_by_tmpl = {v["product_tmpl_id"][0]: v for v in dupe_variants}
+
+        primary_variants = odoo.search(
+            "product.product", [["product_tmpl_id", "=", primary["id"]]], ["id", "default_code"],
+        )
+        code_pool = [v["default_code"] for v in primary_variants if v.get("default_code")]
+        code_pool += [v["default_code"] for v in dupe_variants if v.get("default_code")]
+
+        keys_seen, _, _ = fetch_template_variant_index(odoo, primary["id"])
+        keys_hint = keys_seen if keys_seen else infer_keys_from_codes(code_pool)
+
+        group_rows = []
+        row_to_dupe = {}
+        for d in dupes:
+            v = variant_by_tmpl.get(d["id"])
+            if not v:
+                flagged.append(f"{name!r} (template id={d['id']}): no variant found - left alone")
+                continue
+            if not v.get("default_code"):
+                flagged.append(f"{name!r} (template id={d['id']}): has no default_code to merge by - left alone")
+                continue
+            if v.get("qty_available"):
+                flagged.append(
+                    f"{name!r} ({v['default_code']}): has on-hand stock "
+                    f"({v['qty_available']}) - left alone, flagged for manual review"
+                )
+                continue
+            so_lines = odoo.search("sale.order.line", [["product_id", "=", v["id"]]], ["id"], limit=1)
+            if so_lines:
+                flagged.append(
+                    f"{name!r} ({v['default_code']}): has sale order history - "
+                    f"left alone, flagged for manual review"
+                )
+                continue
+            row = {
+                "default_code": v["default_code"],
+                "attrs": {},
+                "name": name,
+                "barcode": v.get("barcode"),
+                "image_url": None,
+            }
+            group_rows.append(row)
+            row_to_dupe[v["default_code"]] = d["id"]
+
+        if not group_rows:
+            continue
+
+        if DRY_RUN:
+            for row in group_rows:
+                log(f"  [DRY RUN] would attempt to merge duplicate {row['default_code']!r} ({name!r}) into template id={primary['id']}")
+            continue
+
+        try:
+            handled_codes = extend_target_with_new_variants(odoo, primary["id"], group_rows, keys_seen_hint=keys_hint)
+        except Exception as exc:  # noqa: BLE001
+            log(f"  ERROR merging duplicates of {name!r} into template id={primary['id']}: {exc}")
+            flagged.append(f"{name!r}: merge attempt failed ({exc}) - left alone")
+            continue
+
+        for row in group_rows:
+            code = row["default_code"]
+            if code not in handled_codes:
+                flagged.append(
+                    f"{name!r} ({code}): could not recover a confident Color/Size "
+                    f"combo from its code - left alone, flagged for manual review"
+                )
+                continue
+            dupe_id = row_to_dupe.get(code)
+            if not dupe_id:
+                continue
+            odoo.execute(
+                "product.template", "write",
+                [[dupe_id], {
+                    "website_published": False,
+                    "is_published": False,
+                    "sale_ok": False,
+                    "active": False,
+                }],
+            )
+            merged_count += 1
+            log(f"  merged duplicate {code!r} ({name!r}, template id={dupe_id}) into template id={primary['id']} and archived it")
+
+    if flagged:
+        log(f"Duplicate-merge cleanup: {len(flagged)} duplicate(s) left alone for manual review:")
+        for f in flagged:
+            log(f"  {f}")
+
+    return merged_count, len(flagged)
 
 
 # --------------------------------------------------------------------------
@@ -839,9 +1207,40 @@ def main():
 
     # 5. Anything left over (no name match at all, or a name match that
     #    couldn't cleanly attach as a variant) still gets created as a
-    #    flat product, exactly like before - nothing is silently dropped.
+    #    flat product - UNLESS a second, independent check right here
+    #    finds an existing active+published product under that exact
+    #    name after all (this re-checks fresh, rather than trusting the
+    #    batch lookup in step 4, which only ran once against the names
+    #    known at that point). If one exists and one more variant-attach
+    #    attempt against it still can't recover a confident Color/Size
+    #    combo, flat-creating would just recreate the duplicate bug this
+    #    version exists to close - so it's skipped and logged for manual
+    #    review instead, never guessed into a create. Nothing is dropped
+    #    silently either way: every row ends up created, attached, or
+    #    logged as skipped.
+    skipped_would_duplicate = 0
     for row in fallback_rows:
         try:
+            recheck = odoo.search(
+                "product.template",
+                [["name", "=", row["name"]], ["website_published", "=", True]],
+                ["id", "product_variant_count"],
+                context={"active_test": False},
+            )
+            if recheck:
+                retry_target = max(recheck, key=lambda c: c.get("product_variant_count", 0))["id"]
+                handled = extend_target_with_new_variants(odoo, retry_target, [row])
+                if row["default_code"] in handled:
+                    variants_added += 1
+                    continue
+                log(
+                    f"  WARNING: {row['default_code']!r} ({row['name']!r}) matches an "
+                    f"existing product (template id={retry_target}) but a confident "
+                    f"Color/Size combo still couldn't be recovered for it - skipping "
+                    f"rather than flat-creating a duplicate. Needs manual review."
+                )
+                skipped_would_duplicate += 1
+                continue
             create_flat_product(odoo, resolve_category, row)
             created += 1
         except Exception as exc:  # noqa: BLE001
@@ -876,7 +1275,20 @@ def main():
         )
         archived.append(f"{s['default_code']} ({s['name']})")
 
-    # 7. Featured-sort pass. Wrapped so a problem here never erases or
+    # 7. Self-healing duplicate-merge cleanup. Catches any same-name, flat
+    #    duplicate products that exist right now - however they got there,
+    #    not just ones this run itself might have (in theory) created -
+    #    and merges every one it can confidently resolve into a single
+    #    variant-bearing product, archiving the rest. Wrapped so a problem
+    #    here never erases or hides the catalog sync results logged above.
+    merge_merged_count, merge_flagged_count = 0, 0
+    try:
+        merge_merged_count, merge_flagged_count = run_duplicate_merge_cleanup(odoo)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(("duplicate-merge-cleanup", str(exc)))
+        log(f"  ERROR running duplicate-merge cleanup: {exc}")
+
+    # 8. Featured-sort pass. Wrapped so a problem here never erases or
     #    hides the catalog sync results logged above it.
     bumped_count = 0
     try:
@@ -885,13 +1297,15 @@ def main():
         errors.append(("featured-sort", str(exc)))
         log(f"  ERROR running featured-sort: {exc}")
 
-    # 8. Summary.
+    # 9. Summary.
     log("=== Sync complete ===")
     log(f"Updated:                {updated}")
     log(f"Created (flat):         {created}")
     log(f"Attached as variants:   {variants_added}")
     log(f"Already-variant, skipped (price/stock not synced - see docstring): {already_variant_skipped}")
-    log(f"Archived:               {len(archived)}")
+    log(f"Flat-create skipped (would duplicate, flagged for review): {skipped_would_duplicate}")
+    log(f"Archived (no longer in feed): {len(archived)}")
+    log(f"Duplicate-merge cleanup: merged {merge_merged_count} into existing products, flagged {merge_flagged_count} for manual review")
     log(f"Featured-sort bumped:   {bumped_count}")
     for a in archived:
         log(f"  archived: {a}")
