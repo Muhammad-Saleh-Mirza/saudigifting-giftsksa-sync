@@ -876,7 +876,12 @@ def run_duplicate_merge_cleanup(odoo):
     ]
     by_name = {}
     for c in flat_only:
-        by_name.setdefault(c["name"], []).append(c)
+        # .strip() here too (see the ingestion-side note near where
+        # row["name"] is built in main(), below) - groups a stray
+        # whitespace-corrupted name together with its clean-named
+        # siblings instead of silently treating it as its own group of
+        # one and never merging it.
+        by_name.setdefault(c["name"].strip(), []).append(c)
 
     merged_count = 0
     flagged = []
@@ -1077,7 +1082,21 @@ def main():
         rows.append(
             {
                 "id": pid,
-                "name": p.get("name") or code,
+                # .strip() matters here, not just cosmetically: every
+                # name-based duplicate-match (step 4 below, the fallback
+                # safety net in step 5, and run_duplicate_merge_cleanup's
+                # own grouping) is an EXACT string comparison. GiftsKSA's
+                # feed has been observed sending a product's name with a
+                # stray trailing whitespace character on some rows (e.g.
+                # a trailing tab) while every other row/previously-synced
+                # copy of that same product has the clean name - an exact
+                # match then silently fails and the row falls through to
+                # create_flat_product, creating exactly the kind of
+                # duplicate this whole file exists to prevent. Confirmed
+                # live on 2026-10-30: "KSB-1W Stormtech Women's Orbiter
+                # Softshell Jacket" (with a trailing \t, from this feed)
+                # vs. the existing "...Jacket" (no trailing whitespace).
+                "name": (p.get("name") or code).strip(),
                 "default_code": code,
                 "categ_names": [
                     c.get("name") for c in (p.get("public_categ_ids") or []) if c.get("name")
