@@ -24,7 +24,42 @@ Exit behaviour: never partially applies a run. If any of the three GiftsKSA
 API calls fail, the script aborts before touching Odoo at all.
 
 --------------------------------------------------------------------------
-What's new in this version (2026-10-29)
+What's new in this version (2026-10-31)
+--------------------------------------------------------------------------
+Two independent changes, both requested together but scoped separately:
+
+1. Real stock reconciliation. Every run now also pushes the GiftsKSA feed's
+   stock number into Odoo's actual, customer-facing on-hand quantity
+   (stock.quant / qty_available) for every flat, directly-matched product
+   - both on update (existing products, main() step 3) and immediately
+   after create (create_flat_product). Previously this script only wrote
+   the feed's number into x_giftsksa_stock_qty, a custom tracking field
+   that nothing on the storefront actually reads - real on-hand stock
+   could silently drift from what the supplier reports (confirmed live:
+   one product was off by over 200 units). See reconcile_stock_quant()
+   above for exactly how the adjustment is made (always via the standard
+   inventory_quantity + action_apply_inventory() pattern, never a direct
+   write to quantity, and never touching more than one quant per product
+   per run). This does NOT extend to variant-attached codes (see the
+   2026-10-26 "KNOWN, DELIBERATE LIMITATION" below) - that remains a
+   separate, not-yet-built follow-up.
+
+2. 60% website markup. list_price is now set to GiftsKSA's retail_price
+   times PRICE_MARKUP (1.6) instead of retail_price directly - both for
+   brand-new flat products and on every existing flat product's nightly
+   price refresh. Because the existing-product path rewrites list_price
+   unconditionally on every run for every matched code, this also means
+   every already-synced flat product's price self-corrects to the new
+   60%-marked-up basis automatically on the very next run, with no
+   separate one-time repricing script needed for those. A product whose
+   price has since been manually overridden in Odoo will have that
+   override overwritten back to the formula's value on its next sync,
+   same as list_price already behaved before this change (the sync has
+   always unconditionally owned list_price for flat GiftsKSA products;
+   this change only alters the formula, not that pre-existing behavior).
+
+--------------------------------------------------------------------------
+What's new in the previous version (2026-10-29)
 --------------------------------------------------------------------------
 Root-caused and fixed the duplicate-product problem the 2026-10-26
 create-path fix (below) was supposed to prevent but didn't fully: that fix
@@ -145,6 +180,19 @@ PROTECTED_DEFAULT_CODES = {"KSB-1W"}
 REQUEST_TIMEOUT = 60
 RPC_RETRY_ATTEMPTS = 4
 RPC_RETRY_BACKOFF_SECONDS = 5
+
+# Website prices are shown with a 60% markup over GiftsKSA's own
+# retail_price. Applied everywhere list_price is set from retail_price -
+# both for brand-new flat products (create_flat_product) and for every
+# existing flat product's nightly price refresh (main(), step 3) - so a
+# single change here covers both paths consistently.
+PRICE_MARKUP = 1.6
+
+# How far a product's real on-hand stock.quant total is allowed to drift
+# from the latest GiftsKSA feed value before this script corrects it. Kept
+# at 0 (exact match) rather than some slop allowance, since the feed value
+# IS the number we want reflected on the website.
+STOCK_MATCH_TOLERANCE = 0.001
 
 # Some bot-filters in front of these sites reject the default
 # `python-requests/x.y` User-Agent with a bare 403, even for a legitimate,
@@ -436,6 +484,85 @@ class Odoo:
         if context:
             kwargs["context"] = context
         return self.execute(model, "search_read", [domain], kwargs)
+
+
+# --------------------------------------------------------------------------
+# Real stock.quant reconciliation (new in this version - see the "What's
+# new" note at the top of this file). Previously this script only wrote
+# the supplier's reported stock into the x_giftsksa_stock_qty tracking
+# field and never touched the real, customer-facing on-hand quantity
+# (qty_available / stock.quant) - meaning the website could show a product
+# as in stock (or out of stock) based on a number nobody was actually
+# keeping in sync. This section makes every run also push the feed's
+# stock number into Odoo's real inventory, the same safe
+# inventory_quantity + action_apply_inventory() pattern already proven in
+# the one-off KSB-1W fix.
+# --------------------------------------------------------------------------
+
+def get_default_stock_location_id(odoo):
+    """
+    The internal stock location new quants are created at when a flat
+    product has no existing quant anywhere yet (brand-new product, or a
+    product that's only ever been tracked via the old x_giftsksa_stock_qty
+    field). Uses the first warehouse's own "Stock" location - standard
+    single-warehouse Odoo setups only have the one.
+    """
+    warehouses = odoo.search("stock.warehouse", [], ["id", "lot_stock_id"])
+    if not warehouses or not warehouses[0].get("lot_stock_id"):
+        raise RuntimeError(
+            "Could not find any stock.warehouse with a Stock location - "
+            "cannot reconcile real on-hand stock without one."
+        )
+    return warehouses[0]["lot_stock_id"][0]
+
+
+def reconcile_stock_quant(odoo, variant_id, target_qty, default_location_id, label):
+    """
+    Makes a single product.product's real on-hand stock (summed across its
+    internal-location stock.quant rows) match target_qty, the latest
+    GiftsKSA feed value - without ever touching any non-internal location
+    (customer/supplier/transit locations are left alone) and without ever
+    creating a second quant when one already exists (always adjusts the
+    existing one rather than piling up new rows).
+
+    If there's already exactly one internal quant, its inventory_quantity
+    is nudged by the difference and applied. If there are several (e.g.
+    stock split across more than one internal location), the first one
+    found absorbs the whole adjustment rather than guessing how to split
+    it - still correct in total, which is what customer-facing
+    qty_available reflects. If there are none yet, a new quant is created
+    at the default warehouse location.
+    """
+    if DRY_RUN:
+        log(f"  [DRY RUN] would reconcile real stock for {label!r} to {target_qty}")
+        return
+    quants = odoo.search(
+        "stock.quant",
+        [["product_id", "=", variant_id], ["location_id.usage", "=", "internal"]],
+        ["id", "quantity"],
+    )
+    current_total = 0.0
+    for q in quants:
+        current_total += q.get("quantity") or 0.0
+    diff = target_qty - current_total
+    if abs(diff) <= STOCK_MATCH_TOLERANCE:
+        return
+    if quants:
+        q = quants[0]
+        new_qty = (q.get("quantity") or 0.0) + diff
+        odoo.execute("stock.quant", "write", [[q["id"]], {"inventory_quantity": new_qty}])
+        odoo.execute("stock.quant", "action_apply_inventory", [[q["id"]]])
+    else:
+        new_id = odoo.execute(
+            "stock.quant", "create",
+            [{
+                "product_id": variant_id,
+                "location_id": default_location_id,
+                "inventory_quantity": target_qty,
+            }],
+        )
+        odoo.execute("stock.quant", "action_apply_inventory", [[new_id]])
+    log(f"  reconciled real stock for {label!r}: {current_total} -> {target_qty}")
 
 
 # --------------------------------------------------------------------------
@@ -786,22 +913,27 @@ def extend_target_with_new_variants(odoo, target_id, group_rows, keys_seen_hint=
     return handled_codes
 
 
-def create_flat_product(odoo, resolve_category, row):
+def create_flat_product(odoo, resolve_category, row, default_location_id):
     """
     The original "never seen this code before, and no existing product
     matched its name" path: creates a brand-new, standalone
-    product.template for this one SKU. Unchanged from the previous
-    version of this script.
+    product.template for this one SKU. list_price now carries the 60%
+    website markup, and the new product's real on-hand stock is set to
+    match the feed immediately after create (not just the
+    x_giftsksa_stock_qty tracking field) - see the stock-reconciliation
+    section above.
     """
     if DRY_RUN:
-        log(f"  [DRY RUN] would create flat product {row['default_code']!r} ({row['name']!r})")
+        log(f"  [DRY RUN] would create flat product {row['default_code']!r} ({row['name']!r}) "
+            f"at list_price={round((row['retail_price'] or 0) * PRICE_MARKUP, 2)} "
+            f"with real stock={row['stock_qty']}")
         return
     cat_ids = [resolve_category(n) for n in row["categ_names"]]
     cat_ids = [c for c in cat_ids if c]
     vals = {
         "name": row["name"],
         "default_code": row["default_code"],
-        "list_price": row["retail_price"] or 0,
+        "list_price": (row["retail_price"] or 0) * PRICE_MARKUP,
         "type": "consu",
         "sale_ok": True,
         "website_published": True,
@@ -818,7 +950,16 @@ def create_flat_product(odoo, resolve_category, row):
             vals["image_1920"] = fetch_image_b64(row["image_url"])
         except Exception as img_exc:  # noqa: BLE001
             log(f"  warning: image fetch failed for {row['default_code']}: {img_exc}")
-    odoo.execute("product.template", "create", [vals])
+    new_tmpl_id = odoo.execute("product.template", "create", [vals])
+    try:
+        fresh = odoo.search(
+            "product.template", [["id", "=", new_tmpl_id]], ["id", "product_variant_id"],
+        )
+        if fresh and fresh[0].get("product_variant_id"):
+            new_variant_id = fresh[0]["product_variant_id"][0]
+            reconcile_stock_quant(odoo, new_variant_id, row["stock_qty"], default_location_id, row["default_code"])
+    except Exception as stock_exc:  # noqa: BLE001 - never let a stock-reconcile failure block the rest of the run
+        log(f"  warning: real-stock reconcile failed for new product {row['default_code']}: {stock_exc}")
 
 
 # --------------------------------------------------------------------------
@@ -1118,15 +1259,28 @@ def main():
     # 2. Connect to Odoo.
     odoo = Odoo(ODOO_URL, ODOO_DB, ODOO_USERNAME, ODOO_API_KEY)
     resolve_category, newly_created_categories = build_category_resolver(odoo)
+    default_location_id = None
+    if not DRY_RUN:
+        default_location_id = get_default_stock_location_id(odoo)
 
     # 3. Index existing GiftsKSA-sourced products by default_code (this is
     #    the normal "update this flat product's price/stock" path).
+    # product_variant_id is fetched here too (not just default_code/name) -
+    # it's what the real stock.quant reconciliation below writes against,
+    # since quants live on product.product (the variant), not
+    # product.template.
     existing = odoo.search(
         "product.template",
         [["x_giftsksa_source", "=", "giftsksa"]],
-        ["id", "default_code", "name", "x_giftsksa_discontinued"],
+        ["id", "default_code", "name", "x_giftsksa_discontinued", "product_variant_id"],
     )
-    existing_by_code = {e["default_code"]: e["id"] for e in existing if e["default_code"]}
+    existing_by_code = {
+        e["default_code"]: {
+            "tmpl_id": e["id"],
+            "variant_id": e["product_variant_id"][0] if e.get("product_variant_id") else None,
+        }
+        for e in existing if e["default_code"]
+    }
     log(f"Found {len(existing)} existing GiftsKSA-sourced products in Odoo")
 
     # 3b. Also index EVERY coded variant store-wide (not just GiftsKSA-
@@ -1149,12 +1303,13 @@ def main():
     for row in rows:
         code = row["default_code"]
         try:
-            existing_id = existing_by_code.get(code)
-            if existing_id:
+            existing_entry = existing_by_code.get(code)
+            if existing_entry:
+                existing_id = existing_entry["tmpl_id"]
                 cat_ids = [resolve_category(n) for n in row["categ_names"]]
                 cat_ids = [c for c in cat_ids if c]
                 vals = {
-                    "list_price": row["retail_price"] or 0,
+                    "list_price": (row["retail_price"] or 0) * PRICE_MARKUP,
                     "x_giftsksa_stock_qty": row["stock_qty"],
                     "x_giftsksa_discontinued": False,
                     "x_giftsksa_synced_date": run_timestamp,
@@ -1167,6 +1322,14 @@ def main():
                     vals["public_categ_ids"] = [[4, c] for c in cat_ids]
                 odoo.execute("product.template", "write", [[existing_id], vals])
                 updated += 1
+                if existing_entry.get("variant_id"):
+                    try:
+                        reconcile_stock_quant(
+                            odoo, existing_entry["variant_id"], row["stock_qty"],
+                            default_location_id, code,
+                        )
+                    except Exception as stock_exc:  # noqa: BLE001 - never let a stock-reconcile failure block the rest of the run
+                        log(f"  warning: real-stock reconcile failed for {code}: {stock_exc}")
             elif code in known_variant_codes:
                 # Already live in Odoo as a variant of some other product
                 # (most likely a previously-attached merged variant). This
@@ -1260,7 +1423,7 @@ def main():
                 )
                 skipped_would_duplicate += 1
                 continue
-            create_flat_product(odoo, resolve_category, row)
+            create_flat_product(odoo, resolve_category, row, default_location_id)
             created += 1
         except Exception as exc:  # noqa: BLE001
             errors.append((row["default_code"], str(exc)))
